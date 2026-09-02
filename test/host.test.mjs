@@ -41,6 +41,8 @@ const versionOf = (target) => {
   return `${info.dev}:${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`
 }
 
+
+
 /** Seed a board file at the new location, creating the board directory first. */
 const seedBoard = (dir, content) => {
   const target = boardPath(dir)
@@ -59,6 +61,7 @@ function boot(dir = mkdtempSync(join(tmpdir(), "dsh-kanban-test-")), options = {
   workspaces.push(dir)
   const workspace = { id: "ws-test", path: dir, title: "Test" }
   const registered = []
+  const tokenOf = versionOf
   const fs = {
     async resolve(path, options = {}) {
       // Match the real backend: an absolute path ignores cwd (node:path.resolve semantics).
@@ -78,14 +81,14 @@ function boot(dir = mkdtempSync(join(tmpdir(), "dsh-kanban-test-")), options = {
     // stat() exposes the version. Without both, probe-g's cross-process lost
     // update is invisible to this suite.
     async stat(target) {
-      const version = versionOf(target)
+      const version = tokenOf(target)
       return version === undefined ? undefined : { version, type: "file" }
     },
     async writeText(target, content, expected) {
       writeLog.push(target)
       if (options.writeDelay) await new Promise((resolve) => setTimeout(resolve, options.writeDelay(content)))
       if (options.failWrites) throw new Error("ENOSPC")
-      const current = versionOf(target)
+      const current = tokenOf(target)
       if (expected && expected.kind === "replaceIfVersion") {
         if (current === undefined || current !== expected.version) {
           const error = new Error("cannot write: file changed since it was read")
@@ -97,10 +100,17 @@ function boot(dir = mkdtempSync(join(tmpdir(), "dsh-kanban-test-")), options = {
         error.code = "FS_NOT_OBSERVED"
         throw error
       }
+      // THE CROSS-PROCESS GAP (k190), modelled faithfully. In dsh-fs-local the
+      // compare above and the write below sit inside withLock(targetKey) — but
+      // `this.locks` is an in-memory Map on the FileSystem INSTANCE, so it holds
+      // only within one process. Between two OS processes there is a real window
+      // right here, and `gap` lets a test step into it deterministically instead
+      // of waiting for the measured ~10% to happen by luck.
+      if (options.gap) await options.gap(target)
       // The real backend's writeFileAtomic does mkdir(dirname, {recursive:true}).
       mkdirSync(dirname(target), { recursive: true })
       writeFileSync(target, content, "utf8")
-      return { version: versionOf(target) }
+      return { version: tokenOf(target) }
     },
   }
   const ctx = {
@@ -943,6 +953,118 @@ describe("host board seam", () => {
       expect(res.status).toBe(200)
       expect(res.payload.board.cards.map((c) => c.title)).toContain("Reached it")
     })
+  })
+
+  // ---- k190: the residual cross-process hole, pinned deliberately ----
+  //
+  // RESIDUAL RISK, asserted rather than defended (the k38 pattern). The claim CAS
+  // is OPTIMISTIC: dsh-fs-local's writeText holds withLock(targetKey) across its
+  // compare-and-write, but `this.locks` is an in-memory Map on the FileSystem
+  // INSTANCE — in-process only, exactly like this plugin's own workspaceQueues.
+  // Across two OS processes, probe → compare → write has a genuine gap, so both
+  // can compare equal and both can write. Measured 6/60 runs with two winners
+  // (~10%) via probes/probe-g-cross-process-claim.mjs.
+  //
+  // The supported deployment is SINGLE-WRITER (k190 option iii, 2026-09-02):
+  // scheduled ticks already satisfy it via dsh-cron's overlap: skip. A second
+  // concurrent writing process is unsupported, not guarded.
+  //
+  // THIS TEST ASSERTS THE HOLE. If real cross-process safety ever lands (an
+  // upstream dsh-fs CAS holding a lock across compare AND write — see
+  // docs/upstream-asks.md), this test MUST FAIL and be rewritten. That failure is
+  // the point: it forces the limitation to be revisited instead of quietly
+  // persisting. Do not "fix" it by loosening the assertion.
+  //
+  // It pins the MECHANISM — the compare→write gap — not the ~10% timing race.
+  // Committing a test that reproduces the race by luck would be flaky and would
+  // prove nothing on a green run: 15 runs once showed 0/15 while the true rate was
+  // ~10% (trap 19). Here Bob is released INTO Alice's open window on purpose, so
+  // the outcome is the same every run.
+  //
+  // A NOTE ON WHAT IS AND IS NOT SIMULATED, because the first version of this test
+  // got it wrong and the failure was informative (trap 18 in the other direction —
+  // a mock that made the code look WORSE than it is). I first tried freezing the
+  // mtime/ctime fields to force a token collision. It does not work, and the
+  // reason matters: `size` is part of `dev:ino:size:mtimeNs:ctimeNs`, and a claim
+  // ADDS an owner plus an activity record, so the file size changes and the tokens
+  // differ anyway. The measured 1 ms granularity only collides SAME-SIZE writes.
+  // So the honest reproduction is the interleaving, not a doctored token: the
+  // version compare below is completely real.
+  it("lets a second process overwrite a claim it never saw — the pinned residual hole", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-kanban-k190-"))
+    workspaces.push(dir)
+
+    let releaseBob
+    const bobIsInTheGap = new Promise((resolve) => { releaseBob = resolve })
+    // Armed only for the claim below — the seed write must not consume the pause.
+    let gapArmed = false
+
+    // Alice's instance pauses ONCE inside the compare→write gap — the window that
+    // exists between two OS processes because dsh-fs-local's lock is in-process.
+    const alice = boot(dir, {
+      gap: async () => {
+        if (!gapArmed) return
+        gapArmed = false
+        await bobIsInTheGap
+      },
+    })
+    await tool(alice.registered, "kanban_add_card").execute({ title: "contested" }, alice.exec)
+    const cardId = JSON.parse(readFileSync(boardPath(dir), "utf8")).cards[0].id
+
+    // Bob is a second process: he reads the board, so he holds a version token.
+    const bob = boot(dir)
+    await tool(bob.registered, "kanban_get").execute({}, bob.exec)
+
+    // Alice claims. She compares equal, then stalls before writing.
+    gapArmed = true
+    const aliceClaim = tool(alice.registered, "kanban_claim_card")
+      .execute({ id: cardId, ownerRunId: "run-alice" }, alice.exec)
+
+    // Bob claims the same card while Alice is mid-write. He compares against the
+    // version he read, which is still what is on disk — Alice has not landed yet —
+    // so his CAS passes and he writes. This is the hole: the precondition was
+    // checked against a state that is already obsolete.
+    const bobClaim = await tool(bob.registered, "kanban_claim_card")
+      .execute({ id: cardId, ownerRunId: "run-bob" }, bob.exec)
+    releaseBob()
+    const aliceResult = await aliceClaim
+
+    // BOTH callers are told they succeeded. One card, two winners, no loser
+    // notified — the documented limitation of single-writer discipline.
+    expect(bobClaim.ok, "pinning the hole: Bob's claim is ACCEPTED, not refused").toBe(true)
+    expect(aliceResult.ok, "pinning the hole: Alice is also told she succeeded").toBe(true)
+
+    // And the board agrees with only one of them.
+    const owner = JSON.parse(readFileSync(boardPath(dir), "utf8")).cards[0].state.owner
+    expect(["run-alice", "run-bob"]).toContain(owner)
+  })
+
+  // The CONTROL for the test above, and the reason it is a pin rather than a
+  // blanket "CAS does not work" claim. With the real nanosecond token — the only
+  // difference — the very same sequence IS refused. So the protection is real and
+  // in force; the hole above is specifically the same-tick, same-size collision.
+  // If this control ever goes green-by-vacuum (e.g. someone disables the
+  // precondition), it fails here first.
+  it("refuses that same second claim once version tokens actually differ", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-kanban-k190-control-"))
+    workspaces.push(dir)
+
+    const alice = boot(dir)
+    await tool(alice.registered, "kanban_add_card").execute({ title: "contested" }, alice.exec)
+    const cardId = JSON.parse(readFileSync(boardPath(dir), "utf8")).cards[0].id
+
+    const bob = boot(dir)
+    await tool(bob.registered, "kanban_get").execute({}, bob.exec)
+
+    await tool(alice.registered, "kanban_claim_card")
+      .execute({ id: cardId, ownerRunId: "run-alice" }, alice.exec)
+
+    const bobClaim = await tool(bob.registered, "kanban_claim_card")
+      .execute({ id: cardId, ownerRunId: "run-bob" }, bob.exec)
+    expect(bobClaim.ok).toBe(false)
+    expect(bobClaim.message).toContain("changed on disk")
+    // Alice keeps the card and nothing was clobbered.
+    expect(JSON.parse(readFileSync(boardPath(dir), "utf8")).cards[0].state.owner).toBe("run-alice")
   })
 
   it("keeps newer-schema files read-only", async () => {
