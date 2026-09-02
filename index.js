@@ -1423,6 +1423,26 @@ export function apply(ctx) {
     res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
     res.end(JSON.stringify(value))
   }
+  // 信任边界（2026-09-02 实测后写死在这里，item 7 / 卡 k38）。
+  //
+  // 这条路由**没有**、也无法有"已认证会话"的概念：dsh-host-webserver 的 register()
+  // 只把原始的 (req, res) 交给 handler，整个 web 栈里没有任何 cookie / bearer / token
+  // 能把一次 HTTP 请求映射到某个会话。真正存在的认证在更外面一层——反向代理
+  // （~/.dsh/reverse-proxy.json 里的 accessToken 与设备会话），它在 dsh 看到请求之前
+  // 就已经终结，插件永远拿不到那个身份。
+  //
+  // 所以 /api/kanban 的信任边界是：**能连上这个端口**（127.0.0.1:3080 与 tailnet 地址），
+  // 加上前面那层反向代理。下面这些检查是**滥用防护，不是授权**：POST-only、JSON
+  // content-type、1MB body 上限、origin/host 同源、未知 workspaceId 一律 400 而不是
+  // 悄悄回退到某块默认看板。
+  //
+  // 残余风险，明写而不是假装不存在：任何能到达 3080 的调用方，都可以用 body 里的
+  // workspaceId 读写**任何**已登记工作区的看板。
+  //
+  // 绝不要在这里伪造会话绑定——比如信任客户端自己设置的 header。那读起来像认证，
+  // 实际可以随手伪造，比现状更糟：这个项目已经两次栽在"看着是绿的、实际是空的"控制上
+  // （note 上限、隔离写保护）。真正的修法是上游提供一个能把已认证主体交给 handler 的
+  // webServer 接缝，那是 dsh 的改动，不是插件的改动。
   const httpHandler = async (req, res) => {
     try {
       if (req.method !== 'POST') return sendJson(res, 405, { error: 'Method not allowed' })

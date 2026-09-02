@@ -100,6 +100,11 @@ function boot(dir = mkdtempSync(join(tmpdir(), "dsh-kanban-test-")), options = {
     get(name) {
       if (name === "fs") return fs
       if (name === "sandboxPolicy") return { defaultMode: "workspace-write", resolve: () => ({ mode: "workspace-write" }) }
+      // Lets a test capture the /api/kanban handler and drive it directly, so the
+      // HTTP abuse guards are pinned by execution rather than by reading the code.
+      if (name === "webServer" && options.captureRoute) return {
+        register: (route) => { options.captureRoute(route); return () => {} },
+      }
       if (name === "workspaceRegistry") return {
         // `extra` lets a test register a SECOND workspace, so explicit-id routing
         // can be proven to reach a board the calling cwd could never resolve.
@@ -790,6 +795,93 @@ describe("host board seam", () => {
     const second = await tool(registered, "kanban_get").execute({}, exec)
     expect(second.warnings.some((w) => w.includes("quarantined"))).toBe(true)
     expect(second.board.readOnlyReason).toContain("board.json.corrupt-")
+  })
+
+  // ---- /api/kanban trust boundary (item 7, card k38) ----
+  // DECIDED OPTION B: this route has no authenticated session and cannot have one —
+  // dsh-host-webserver hands the handler a raw (req, res) and nothing in the web
+  // stack maps a request to a session. The real auth is the reverse proxy, one
+  // layer out. So these are ABUSE GUARDS, NOT AUTHORIZATION, and the residual risk
+  // is explicit: anything that reaches the port can address any registered board.
+  // These tests pin the guards that DO exist so a refactor cannot quietly drop
+  // them, and pin the residual behaviour so it cannot be mistaken for a control.
+  describe("/api/kanban abuse guards", () => {
+    const call = async (handler, { method = "POST", headers = {}, body = "" } = {}) => {
+      const chunks = body ? [Buffer.from(body)] : []
+      const req = Object.assign((async function* () { yield* chunks })(), {
+        method,
+        headers: { "content-type": "application/json", ...headers },
+      })
+      let status = 0
+      let payload
+      const res = {
+        writeHead(code) { status = code },
+        end(text) { payload = text ? JSON.parse(text) : undefined },
+      }
+      await handler(req, res)
+      return { status, payload }
+    }
+
+    const bootRoute = (extra) => {
+      let route
+      const { workspace, registered, exec } = boot(undefined, {
+        captureRoute: (r) => { route = r },
+        ...(extra || {}),
+      })
+      expect(route, "the plugin must register /api/kanban").toBeTruthy()
+      expect(route.path).toBe("/api/kanban")
+      return { handler: route.handler, workspace, registered, exec }
+    }
+
+    it("refuses non-POST, non-JSON, oversized and cross-origin requests", async () => {
+      const { handler, workspace } = bootRoute()
+      const args = JSON.stringify({ method: "get", args: { workspaceId: workspace.id } })
+
+      expect((await call(handler, { method: "GET" })).status).toBe(405)
+      expect((await call(handler, { headers: { "content-type": "text/plain" } })).status).toBe(415)
+      // Origin must match Host — the browser-side CSRF guard.
+      const crossOrigin = await call(handler, {
+        headers: { origin: "http://evil.example", host: "127.0.0.1:3080" },
+        body: args,
+      })
+      expect(crossOrigin.status).toBe(403)
+      // Same-origin is allowed through.
+      expect((await call(handler, {
+        headers: { origin: "http://127.0.0.1:3080", host: "127.0.0.1:3080" },
+        body: args,
+      })).status).toBe(200)
+      // 1 MB body cap.
+      const huge = await call(handler, { body: "x".repeat(1024 * 1024 + 10) })
+      expect(huge.status).toBe(413)
+    })
+
+    it("refuses an unknown workspace instead of falling back to a default board", async () => {
+      const { handler } = bootRoute()
+      // The dangerous failure would be defaulting to SOME board; it must 400.
+      for (const bad of [{ method: "get", args: { workspaceId: "no-such-ws" } }, { method: "get", args: {} }]) {
+        const res = await call(handler, { body: JSON.stringify(bad) })
+        expect(res.status).toBe(400)
+        expect(res.payload.error).toContain("Unknown workspace")
+      }
+    })
+
+    // RESIDUAL RISK, pinned deliberately: a body-supplied workspaceId IS honoured
+    // for any registered workspace. This is not a control — it is the documented
+    // consequence of having no session. If a future change adds real auth, this
+    // test should FAIL and be rewritten; that is the point of pinning it.
+    it("honours any registered workspaceId — the documented residual risk", async () => {
+      const other = mkdtempSync(join(tmpdir(), "dsh-kanban-other-"))
+      workspaces.push(other)
+      const otherWorkspace = { id: "ws-other", path: other, title: "Other" }
+      const { handler } = bootRoute({ extra: [otherWorkspace] })
+
+      // A caller that never had anything to do with ws-other reaches its board.
+      const res = await call(handler, {
+        body: JSON.stringify({ method: "addCard", args: { workspaceId: "ws-other", title: "Reached it" } }),
+      })
+      expect(res.status).toBe(200)
+      expect(res.payload.board.cards.map((c) => c.title)).toContain("Reached it")
+    })
   })
 
   it("keeps newer-schema files read-only", async () => {
