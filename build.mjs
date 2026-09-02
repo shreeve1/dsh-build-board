@@ -64,4 +64,6 @@ const wrapped = [
   '})',
 ].join('\n')
 writeFileSync(resolve(root, 'lib/client.js'), wrapped)
-console.log('✓ built lib/client.js (' + wrapped.length + ' bytes)')
+// 输出到 stderr：prepack 会在 npm pack --json 的 stdout 上执行本脚本，
+// 任何 stdout 输出都会破坏 --json 解析（check:package 依赖这一点）。
+console.error('✓ built lib/client.js (' + wrapped.length + ' bytes)')

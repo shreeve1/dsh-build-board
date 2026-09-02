@@ -4,7 +4,7 @@ import { ChatDraftInjector } from "./components/ChatDraftInjector"
 import { installLocale, t } from "./lib/i18n"
 
 export const KanbanPlugin = {
-  name: "dsh-kanban",
+  name: "dsh-build-board",
   inject: ["slots", "locale"],
   apply(ctx: any) {
     installLocale(ctx)
