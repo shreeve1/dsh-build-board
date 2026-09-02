@@ -955,6 +955,42 @@ describe("host board seam", () => {
     })
   })
 
+  // k254: this MUST be a RENDER-level assertion. The readyCards case already
+  // filtered and sorted correctly, and a result-object test passed the whole time
+  // — while a live probe on the running host showed kanban_ready_cards printing
+  // "2 ready card(s)" above a list of all THREE cards including the claimed one.
+  // The sorted list was computed and then discarded, because every tool rendered
+  // through renderBoard, which prints value.board.cards (the whole board) and
+  // never reads value.cards. Assert what the agent actually READS.
+  it("renders ONLY the ready cards, in priority order, and drops a claimed one", async () => {
+    const { registered, exec } = boot()
+    const add = tool(registered, "kanban_add_card")
+    await add.execute({ title: "low card", priority: "low" }, exec)
+    await add.execute({ title: "high card", priority: "high" }, exec)
+    await add.execute({ title: "medium card", priority: "medium" }, exec)
+
+    const readyTool = tool(registered, "kanban_ready_cards")
+    const before = await readyTool.execute({}, exec)
+    const textBefore = readyTool.output.render({}, before)[0].text
+
+    // Ordering must be visible in the RENDERED text, not just the result object.
+    expect(textBefore).toContain("3 ready card(s)")
+    expect(textBefore.indexOf("high card")).toBeLessThan(textBefore.indexOf("medium card"))
+    expect(textBefore.indexOf("medium card")).toBeLessThan(textBefore.indexOf("low card"))
+    expect(textBefore).toContain("[high]")
+
+    // Claim the top card; it must vanish from the rendered list, not just the count.
+    const highId = before.cards[0].id
+    await tool(registered, "kanban_claim_card").execute({ id: highId, ownerRunId: "run-1" }, exec)
+
+    const after = await readyTool.execute({}, exec)
+    const textAfter = readyTool.output.render({}, after)[0].text
+    expect(textAfter).toContain("2 ready card(s)")
+    expect(textAfter, "the claimed card must not be listed as ready").not.toContain(highId)
+    expect(textAfter).toContain("medium card")
+    expect(textAfter).toContain("low card")
+  })
+
   // ---- k190: the residual cross-process hole, pinned deliberately ----
   //
   // RESIDUAL RISK, asserted rather than defended (the k38 pattern). The claim CAS

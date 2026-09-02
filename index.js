@@ -1909,7 +1909,45 @@ export function apply(ctx) {
       name: 'kanban_ready_cards',
       description: 'List cards that are ready to be worked: unowned AND in one of the six working stages (never Blocked, never Archive). Use this instead of filtering kanban_get yourself — the filter is the board\'s job, not the prompt\'s.',
       parameters: params({ column: { type: 'string', description: 'Restrict to one stage id or title (optional)' } }, []),
-      output: output(renderBoard),
+      // 这个动词必须用自己的渲染器，不能复用 renderBoard。renderBoard 打印的是
+      // value.board.cards——整块看板——而 readyCards 真正的结果在 value.cards 里：
+      // 过滤掉已认领的卡，并按 high>medium>low、同级取更早创建的顺序排好。
+      // 复用 renderBoard 会把这个排好序的列表算出来又丢掉：实测 2026-09-02 在运行中的
+      // 宿主上，认领 k245 之后 kanban_ready_cards 打印 "2 ready card(s)"，底下却仍然
+      // 列出全部三张卡、包括刚被认领的那张——数量和列表自相矛盾，调用方根本挑不出
+      // "第一张就绪的卡"。排序是判断，看板特意把它从 3am 的提示词里收了回来（见
+      // readyCards 的注释），却在最后一寸上被渲染层丢掉。
+      // 所以这里打印 value.cards，并显式带上 priority 和所属阶段。其余动词继续用
+      // renderBoard——对它们来说"显示整块看板"才是对的。
+      output: {
+        schema: resultSchema,
+        render: (args, value) => {
+          const lines = []
+          if (Array.isArray(value && value.warnings)) {
+            for (const w of value.warnings) lines.push('⚠ ' + w)
+          }
+          lines.push(String((value && value.message) || ''))
+          const cards = value && Array.isArray(value.cards) ? value.cards : []
+          const columns = value && value.board && Array.isArray(value.board.columns) ? value.board.columns : []
+          const titleOf = (id) => {
+            const col = columns.find((c) => c.id === id)
+            return col ? col.title : id
+          }
+          if (cards.length === 0) lines.push('(no ready cards)')
+          // 顺序就是 readyCards 排好的顺序，逐条编号，让"取第一张"有明确所指。
+          for (let i = 0; i < cards.length; i += 1) {
+            const card = cards[i]
+            lines.push(
+              '  ' + (i + 1) + '. [' + card.id + '] ' +
+              '[' + (card.priority || 'no priority') + '] ' +
+              '[' + titleOf(card.columnId) + '] ' +
+              (card.label ? '[' + card.label + '] ' : '') +
+              card.title,
+            )
+          }
+          return [{ type: 'text', text: lines.join('\n') }]
+        },
+      },
       async execute(args, exec) {
         return runTool('readyCards', args, exec)
       },
