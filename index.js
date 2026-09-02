@@ -1076,6 +1076,20 @@ export function apply(ctx) {
           if (!col || !WORKING_STAGES.has(col.title)) return false
           return !wanted || col.id === wanted || col.title === wanted
         })
+        // 顺序也是判断，所以由看板定，而不是留给 3am 的提示词：
+        // high > medium > low（看板自己的枚举），同优先级取更早创建的。
+        // 无优先级的卡排在 low 之后，创建时间缺失的排最后但保持稳定顺序。
+        ready.sort((x, y) => {
+          const rank = (c) => (c.priority ? PRIORITIES.indexOf(c.priority) : PRIORITIES.length)
+          const byPriority = rank(x) - rank(y)
+          if (byPriority !== 0) return byPriority
+          const at = (c) => (typeof c.createdAt === 'string' ? Date.parse(c.createdAt) : NaN)
+          const ax = at(x)
+          const ay = at(y)
+          if (Number.isFinite(ax) && Number.isFinite(ay) && ax !== ay) return ax - ay
+          if (Number.isFinite(ax) !== Number.isFinite(ay)) return Number.isFinite(ax) ? -1 : 1
+          return 0
+        })
         return {
           board: cloneBoard(board),
           persisted: persisted(),
@@ -1473,7 +1487,10 @@ export function apply(ctx) {
       const result = await dispatch(workspace, method, args, 'human')
       return sendJson(res, result.error ? 400 : 200, result)
     } catch (err) {
-      const status = err instanceof SyntaxError ? 400 : 500
+      // BOARD_STALE 不是故障：服务端工作正常，只是拒绝覆盖别人刚写进去的内容。
+      // 500 会被浏览器、代理日志和告警规则当成"服务挂了"；409 才是"重新拉一次再来"。
+      // 真正的内部错误仍然是 500——不要把 catch-all 整体降级成 400。
+      const status = err instanceof SyntaxError ? 400 : err && err.code === 'BOARD_STALE' ? 409 : 500
       return sendJson(res, status, { error: String((err && err.message) || err) })
     }
   }

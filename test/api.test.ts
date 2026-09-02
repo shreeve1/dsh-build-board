@@ -35,4 +35,26 @@ describe("kanban API client", () => {
     }))
     await expect(callKanban("deleteCard", { id: "missing" }, "ws")).rejects.toThrow("Card not found")
   })
+
+  // 409 means another process wrote first and NOTHING changed — the caller should
+  // refetch rather than treat it as a generic failure. The flag is what lets the
+  // view tell those apart; an ordinary 400 must NOT carry it.
+  it("marks a 409 conflict as stale so the view can refetch", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      json: async () => ({ error: "Board changed on disk since this process read it" }),
+    }))
+    await expect(callKanban("addCard", { title: "x" }, "ws"))
+      .rejects.toMatchObject({ stale: true, message: expect.stringContaining("changed on disk") })
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      json: async () => ({ error: "Unknown workspace" }),
+    }))
+    const plain = await callKanban("get", {}, "ws").catch((e) => e)
+    expect(plain.message).toContain("Unknown workspace")
+    expect(plain.stale).toBeUndefined()
+  })
 })

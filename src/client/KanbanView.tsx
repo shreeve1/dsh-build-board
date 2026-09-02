@@ -136,6 +136,14 @@ export function KanbanView(props: KanbanViewProps) {
         return true
       } catch (e: any) {
         setError(t("actionFailed") + String((e && e.message) || e))
+        // 409：别的进程先写了盘，这次写入被拒绝且什么都没改。重新拉一次看板，
+        // 让用户看到真实状态，而不是停在一块已经过期的视图上。
+        if (e && e.stale) {
+          const reloadId = ++issuedRequestRef.current
+          callKanban("get", {}, workspaceId)
+            .then((res) => applyBoard(res, workspaceId, reloadId))
+            .catch(() => {})
+        }
         return false
       }
     },

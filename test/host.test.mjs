@@ -27,11 +27,18 @@ afterEach(() => {
 /** Where the board file for a workspace directory now lands. */
 const boardPath = (dir, suffix = "") => join(homeDir, ".dsh-boards", basename(dir), "board.json" + suffix)
 
-/** File version the fake backend reports, mirroring dsh-fs-local's mtime/size identity. */
+/**
+ * File version the fake backend reports. This MUST mirror dsh-fs-local's identity
+ * (`dev:ino:size:mtimeNs:ctimeNs`, lib/index.js:142) — NANOSECOND precision.
+ * An earlier version used mtimeMs and two writes inside the same millisecond
+ * produced an identical version, so a stale write compared EQUAL and slipped
+ * through the CAS. Measured: 166 of 200 back-to-back writes collide at ms
+ * granularity. Trap 9 once more — a mock coarser than the backend hides the bug.
+ */
 const versionOf = (target) => {
   if (!existsSync(target)) return undefined
-  const info = statSync(target)
-  return info.mtimeMs + ":" + info.size + ":" + info.ino
+  const info = statSync(target, { bigint: true })
+  return `${info.dev}:${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`
 }
 
 /** Seed a board file at the new location, creating the board directory first. */
@@ -583,6 +590,28 @@ describe("host board seam", () => {
     expect(ids).not.toContain(parkedId)
   })
 
+  // Ordering is JUDGEMENT, so the board owns it rather than the 3am prompt: the
+  // plan's STEP 2 says priority high > medium > low (the board's own enum), then
+  // oldest. Insertion order here is deliberately the REVERSE of the expected
+  // order, so a verb that just returns board order fails this.
+  it("returns ready cards in priority then oldest-first order", async () => {
+    const { registered, exec } = boot()
+    const add = tool(registered, "kanban_add_card")
+    const mk = async (title, priority) => (await add.execute({ title, ...(priority ? { priority } : {}) }, exec))
+      .board.cards.find((c) => c.title === title).id
+
+    const none = await mk("no priority")
+    const lowOld = await mk("low old", "low")
+    const highNew = await mk("high new", "high")
+    const medium = await mk("medium", "medium")
+    // Same priority, created later than highNew — must come after it.
+    const highOlder = await mk("high newer", "high")
+
+    const ready = await tool(registered, "kanban_ready_cards").execute({}, exec)
+    const ordered = ready.cards.map((c) => c.id)
+    expect(ordered).toEqual([highNew, highOlder, medium, lowOld, none])
+  })
+
   // Every verb's refusal path. A verb that fails silently, or half-applies, is
   // worse than one that errors: at 3am nobody reads the difference.
   it("refuses invalid verb input without mutating the card", async () => {
@@ -863,6 +892,38 @@ describe("host board seam", () => {
         expect(res.status).toBe(400)
         expect(res.payload.error).toContain("Unknown workspace")
       }
+    })
+
+    // A refused stale write is NOT a server fault: the host worked correctly and
+    // declined to clobber another process's newer write. 500 reads as "outage" to
+    // browsers, proxy logs and alert rules; 409 reads as "refetch and retry".
+    // The HTTP path must be driven in ISOLATION here — if a tool call on the same
+    // instance runs first it clears the stale cache (correct BOARD_STALE recovery)
+    // and the HTTP call then succeeds with 200, hiding the bug. That false pass is
+    // exactly what the first version of this check did.
+    it("answers a stale-board write with 409, not 500", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "dsh-kanban-409-"))
+      workspaces.push(dir)
+      const first = boot(dir)
+      await tool(first.registered, "kanban_add_card").execute({ title: "seed" }, first.exec)
+
+      // Second instance learns the file version through the HTTP path only.
+      let route
+      boot(dir, { captureRoute: (r) => { route = r } })
+      const httpCall = (body) => call(route.handler, { body: JSON.stringify(body) })
+      await httpCall({ method: "get", args: { workspaceId: "ws-test" } })
+
+      // First instance writes; the second instance is now holding a stale version.
+      await tool(first.registered, "kanban_add_card").execute({ title: "winner" }, first.exec)
+
+      const stale = await httpCall({ method: "addCard", args: { workspaceId: "ws-test", title: "loser" } })
+      expect(stale.status).toBe(409)
+      expect(stale.payload.error).toContain("changed on disk")
+
+      // The catch-all was NOT widened: malformed JSON is still a 400, and only
+      // BOARD_STALE was carved out of the 500 branch.
+      const malformed = await call(route.handler, { body: "{" })
+      expect(malformed.status).toBe(400)
     })
 
     // RESIDUAL RISK, pinned deliberately: a body-supplied workspaceId IS honoured

@@ -18,7 +18,11 @@ export function callKanban(
       throw new Error(`Kanban request failed (${response.status})`)
     }
     if (!response.ok || payload.error) {
-      throw new Error(payload.error || `Kanban request failed (${response.status})`)
+      const error = new Error(payload.error || `Kanban request failed (${response.status})`)
+      // 409 = 别的进程先写了盘，本次写入被拒绝，什么都没改。调用方应当重新拉一次
+      // 看板再决定，而不是把它当成一次普通失败——标记出来，UI 才能区分。
+      if (response.status === 409) (error as Error & { stale?: boolean }).stale = true
+      throw error
     }
     return payload
   })
