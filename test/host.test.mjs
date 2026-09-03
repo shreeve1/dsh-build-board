@@ -552,6 +552,144 @@ describe("host board seam", () => {
     expect(vague.ok).toBe(false)
   })
 
+  // A "bounce" that moves FORWARD is a promote with none of promote's evidence
+  // requirements, recorded as a bounce. Measured 2026-09-03: bounce(Spec ->
+  // Review) succeeded, skipping four stages and incrementing bounceCount. The
+  // per-stage tick design makes this reachable by a single wrong toStage in a
+  // job that can only see its own column, so it is enforced in the board rather
+  // than asked for in six prompts.
+  it("refuses a bounce that moves forward, in both bounce and finalize", async () => {
+    const { registered, exec } = boot()
+    const add = tool(registered, "kanban_add_card")
+    const bounce = tool(registered, "kanban_bounce_card")
+    const getCard = tool(registered, "kanban_get_card")
+
+    // Look the card up by TITLE, never by cards[0]: boot() reuses the workspace id
+    // "ws-test", so an index-based lookup can pick up a card left by an earlier
+    // test and assert against the wrong card's counters.
+    const id = (await add.execute({ title: "Forward bouncer" }, exec)).board.cards.find((c) => c.title === "Forward bouncer").id
+    const forward = await bounce.execute({ id, toStage: "Review", reason: "probe: forward bounce" }, exec)
+    expect(forward.ok, "Spec -> Review is a promote wearing a bounce's clothes").toBe(false)
+    expect(forward.message).toContain("must move BACKWARD")
+
+    // REJECTION MUST LEAVE NO TRACE. A refusal that still moved the card or bumped
+    // a counter would be worse than allowing it: the board would disagree with its
+    // own audit trail.
+    const untouched = await getCard.execute({ id }, exec)
+    const spec = forward.board.columns.find((c) => c.title === "Spec")
+    expect(untouched.card.columnId).toBe(spec.id)
+    expect(untouched.card.state.bounceCount).toBe(0)
+    expect(untouched.card.state.bouncesByEdge).toEqual({})
+    expect(untouched.card.state.lastBounceReason).toBe(null)
+
+    // Same stage is not backward either.
+    expect((await bounce.execute({ id, toStage: "Spec", reason: "probe: sideways" }, exec)).ok).toBe(false)
+
+    // Backward across SEVERAL stages stays legal — the tool documents "one or
+    // more stages", and Review -> Spec is a real edge (a spec defect found late).
+    const far = (await add.execute({ title: "Long bouncer" }, exec)).board.cards.find((c) => c.title === "Long bouncer").id
+    await tool(registered, "kanban_move_card").execute({ id: far, columnId: "Review" }, exec)
+    const back = await bounce.execute({ id: far, toStage: "Spec", reason: "probe: spec item 3 contradicts item 5" }, exec)
+    expect(back.ok, "multi-stage BACKWARD must stay allowed").toBe(true)
+    const landed = await getCard.execute({ id: far }, exec)
+    expect(landed.card.state.bouncesByEdge["Review->Spec"]).toBe(1)
+
+    // Blocked is not a pipeline stage: park it with the blocked outcome instead.
+    const parked = await bounce.execute({ id: far, toStage: "Blocked", reason: "probe: not a stage" }, exec)
+    expect(parked.ok).toBe(false)
+    expect(parked.message).toContain("pipeline stage")
+
+    // THE AUTHORITATIVE PATH: finalize(outcome:"bounce") resolves its own target
+    // and had the identical hole. This is the one the tick actually uses to
+    // reconcile a dispatched stage, so it matters more than bounceCard.
+    const fin = (await add.execute({ title: "Finalize forward" }, exec)).board.cards.find((c) => c.title === "Finalize forward").id
+    await tool(registered, "kanban_claim_card").execute({ id: fin, ownerRunId: "run-f" }, exec)
+    await tool(registered, "kanban_dispatch_card").execute({ id: fin, stage: "Spec", teamName: "t" }, exec)
+    const finForward = await tool(registered, "kanban_finalize_card")
+      .execute({ id: fin, stage: "Spec", outcome: "bounce", toStage: "Verify", reason: "probe: forward finalize" }, exec)
+    expect(finForward.ok).toBe(false)
+    expect(finForward.message).toContain("must move BACKWARD")
+    // And the dispatch survives the refusal, so the stage can still be finalized
+    // correctly afterwards — a rejected finalize must not consume the claim.
+    const stillDispatched = await getCard.execute({ id: fin }, exec)
+    expect(stillDispatched.card.state.dispatched).toMatchObject({ stage: "Spec" })
+    expect(stillDispatched.card.state.owner).toBe("run-f")
+    expect(stillDispatched.card.state.bounceCount).toBe(0)
+  })
+
+  // EMPTY_STATE was spread SHALLOWLY into every new card, so bouncesByEdge and
+  // laneBranches were ONE shared object across every card, every board and every
+  // workspace in the process — and mutating a card mutated the module constant
+  // itself. Found 2026-09-03 by a test that failed only when run after another
+  // bounce test; the pollution looked like test-ordering flakiness and was a real
+  // data-corruption bug. The per-stage design (six ticks sharing one apply())
+  // makes this strictly more likely, not less.
+  it("gives every card its own state objects, not shared references", async () => {
+    const { registered, exec } = boot()
+    const add = tool(registered, "kanban_add_card")
+    const getCard = tool(registered, "kanban_get_card")
+
+    const first = (await add.execute({ title: "First" }, exec)).board.cards.find((c) => c.title === "First").id
+    await tool(registered, "kanban_move_card").execute({ id: first, columnId: "Verify" }, exec)
+    await tool(registered, "kanban_bounce_card").execute({ id: first, toStage: "Build", reason: "probe: exit 1" }, exec)
+
+    // A card created AFTER that bounce must start clean.
+    const second = (await add.execute({ title: "Second" }, exec)).board.cards.find((c) => c.title === "Second").id
+    const fresh = await getCard.execute({ id: second }, exec)
+    expect(fresh.card.state.bouncesByEdge, "a new card must not inherit another card's bounce edges").toEqual({})
+    expect(fresh.card.state.bounceCount).toBe(0)
+    expect(fresh.card.state.laneBranches).toEqual([])
+
+    // The returned clone must be a real copy: mutating it must not reach the board.
+    const clone = await getCard.execute({ id: first }, exec)
+    clone.card.state.bouncesByEdge["Injected->Edge"] = 99
+    clone.card.state.laneBranches.push("auto/injected")
+    const reread = await getCard.execute({ id: first }, exec)
+    expect(reread.card.state.bouncesByEdge["Injected->Edge"], "a clone must not be a window into the board").toBeUndefined()
+    expect(reread.card.state.laneBranches).toEqual([])
+
+    // And the exported constant itself must still be pristine.
+    expect(EMPTY_STATE.bouncesByEdge).toEqual({})
+    expect(EMPTY_STATE.laneBranches).toEqual([])
+  })
+
+  // specPath and laneBranches were validated, migrated, cloned and rendered — but
+  // NO verb could write them. laneBranches is the only handoff between stages
+  // under the per-stage design (Decompose creates the worktree, Build/Verify/
+  // Review reuse it, Merge clears it), so without this the stages cannot find
+  // each other's work and would have to guess paths.
+  it("writes specPath and laneBranches, the cross-stage handoff fields", async () => {
+    const { registered, exec } = boot()
+    const id = (await tool(registered, "kanban_add_card").execute({ title: "Handoff" }, exec)).board.cards[0].id
+    const update = tool(registered, "kanban_update_card")
+    const getCard = tool(registered, "kanban_get_card")
+
+    expect((await getCard.execute({ id }, exec)).card.state.specPath).toBe(null)
+
+    await update.execute({ id, specPath: "specs/hl-0007.md", laneBranches: ["auto/hl-0007"] }, exec)
+    const set = await getCard.execute({ id }, exec)
+    expect(set.card.state.specPath).toBe("specs/hl-0007.md")
+    expect(set.card.state.laneBranches).toEqual(["auto/hl-0007"])
+    // Visible through the tool, not just in the result object (the k386 lesson).
+    expect(getCard.output.render({}, set)[0].text).toContain("auto/hl-0007")
+
+    // Merge clears the lane when it cleans up; empty string clears specPath.
+    await update.execute({ id, specPath: "", laneBranches: [] }, exec)
+    const cleared = await getCard.execute({ id }, exec)
+    expect(cleared.card.state.specPath).toBe(null)
+    expect(cleared.card.state.laneBranches).toEqual([])
+
+    // Non-string lane entries are dropped rather than persisted, so a malformed
+    // write cannot corrupt the field its own validator would later reject.
+    await update.execute({ id, laneBranches: ["auto/ok", "", 42, null] }, exec)
+    expect((await getCard.execute({ id }, exec)).card.state.laneBranches).toEqual(["auto/ok"])
+
+    // Both changes are auditable: the trail is the only clue when a card later
+    // cannot find its own code.
+    const persisted = await tool(registered, "kanban_get").execute({}, exec)
+    expect(persisted.ok).toBe(true)
+  })
+
   it("reaps only stale claims and never promotes them", async () => {
     const { dir, registered, exec } = boot()
     const add = await tool(registered, "kanban_add_card").execute({ title: "Crashed mid-flight" }, exec)
@@ -688,11 +826,15 @@ describe("host board seam", () => {
     expect(await tool(registered, "kanban_bounce_card")
       .execute({ id: bounceId, toStage: "Build", reason: "probe: gate exited 1" }, exec)).toMatchObject({ ok: true })
 
+    // Dispatched at Verify so the bounce has somewhere BACKWARD to go: a bounce
+    // must move backward, so Spec -> Spec (the original form of this assertion)
+    // is now correctly refused and could not prove title resolution.
     const finalId = await newCard("f1")
+    await tool(registered, "kanban_move_card").execute({ id: finalId, columnId: "Verify" }, exec)
     await tool(registered, "kanban_claim_card").execute({ id: finalId, ownerRunId: "run-c" }, exec)
-    await tool(registered, "kanban_dispatch_card").execute({ id: finalId, stage: "Spec", teamName: "t" }, exec)
+    await tool(registered, "kanban_dispatch_card").execute({ id: finalId, stage: "Verify", teamName: "t" }, exec)
     expect(await tool(registered, "kanban_finalize_card")
-      .execute({ id: finalId, stage: "Spec", outcome: "bounce", toStage: "Spec", reason: "probe: failing check" }, exec))
+      .execute({ id: finalId, stage: "Verify", outcome: "bounce", toStage: "Build", reason: "probe: failing check" }, exec))
       .toMatchObject({ ok: true })
 
     const ready = await tool(registered, "kanban_ready_cards").execute({ column: "Build" }, exec)

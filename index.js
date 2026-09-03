@@ -105,12 +105,30 @@ export const EMPTY_STATE = {
   laneBranches: [],
   heartbeatAt: null,
 }
+// EMPTY_STATE 必须**深**拷贝。`{ ...EMPTY_STATE }` 是浅拷贝，bouncesByEdge 和
+// laneBranches 两个引用会被所有卡片共享：一张卡 bounce 一次，同一个进程里之后
+// 创建的每一张卡（跨工作区、跨看板）都会看到那条计数，模块常量本身也被就地改写。
+// 2026-09-03 实测确认：A 卡写入 {'Verify->Build':1} 之后，B 卡读到同一份对象。
+// 之所以一直没炸，是因为写盘的是 cloneBoard 的结果（:836 用 spread 覆盖了这两个
+// 键），所以磁盘上的板子看起来正常——脏的是内存里新建卡的初始值。per-stage 设计
+// 会让六个 tick 共享同一个 apply() 实例，这条串扰只会更常发生。
+export const freshState = () => ({ ...EMPTY_STATE, bouncesByEdge: {}, laneBranches: [] })
+
+// 同样的理由，用在"已有 state 的深拷贝"上：把嵌套的三个可变字段真正复制一份。
+export const cloneState = (src) => ({
+  ...freshState(),
+  ...src,
+  bouncesByEdge: { ...(isObj(src.bouncesByEdge) ? src.bouncesByEdge : {}) },
+  laneBranches: Array.isArray(src.laneBranches) ? [...src.laneBranches] : [],
+  dispatched: isObj(src.dispatched) ? { ...src.dispatched } : null,
+})
+
 const nullableStr = (v) => (typeof v === 'string' && v ? v : null)
 
 // 只在迁移里用：把 v3 及更早的卡片补上 state。已经是 v4 的文件不走这里——
 // 那种文件里的坏 state 由 stateErrorOf 判为损坏并隔离，而不是被默默修好。
 export const normState = (s) => {
-  if (!isObj(s)) return { ...EMPTY_STATE }
+  if (!isObj(s)) return freshState()
   const count = Number(s.bounceCount ?? s.bounces)
   const edges = {}
   if (isObj(s.bouncesByEdge)) {
@@ -506,7 +524,7 @@ export function parseBoardText(text) {
   const filled = {
     ...data,
     workspacePath: data.workspacePath == null ? null : data.workspacePath,
-    cards: data.cards.map((c) => (c.state == null ? { ...c, state: { ...EMPTY_STATE } } : c)),
+    cards: data.cards.map((c) => (c.state == null ? { ...c, state: freshState() } : c)),
   }
   return { ok: true, kind: 'ok', data: filled, migrated, fromVersion: version, warnings }
 }
@@ -833,7 +851,10 @@ export function apply(ctx) {
       createdAt: typeof c.createdAt === 'string' ? c.createdAt : null,
       createdBy: typeof c.createdBy === 'string' ? c.createdBy : null,
       // v4：state 必须跟着 clone 走，否则认领/租约信息在返回调用方的路上就没了。
-      state: { ...EMPTY_STATE, ...(isObj(c.state) ? c.state : {}) },
+      // 而且必须**深**走：bouncesByEdge / laneBranches 只做浅拷贝的话，返回给调用方的
+      // "克隆"仍然指向看板里那两个活对象，调用方改一下就等于绕过所有动词直接改看板。
+      // dispatched 同理——它是 finalize 的 CAS 比较对象，共享引用会让比较不可信。
+      state: cloneState(isObj(c.state) ? c.state : {}),
       comments: Array.isArray(c.comments)
         ? c.comments.map((comment) => ({
             id: comment.id,
@@ -941,7 +962,7 @@ export function apply(ctx) {
           createdAt: new Date().toISOString(),
           createdBy: actor,
           comments: [],
-          state: { ...EMPTY_STATE },
+          state: freshState(),
         }
         board.cards.push(card)
         record(board, {
@@ -971,16 +992,32 @@ export function apply(ctx) {
             note: card.note,
             label: card.label ?? null,
             priority: card.priority ?? null,
+            specPath: card.state.specPath ?? null,
+            laneBranches: card.state.laneBranches.join(','),
           }
           if (typeof a.title === 'string') card.title = a.title || card.title
           if (typeof a.note === 'string') card.note = a.note
           if (typeof a.label === 'string') card.label = nextLabel || undefined
           if (typeof a.priority === 'string') card.priority = normPriority(a.priority)
+          // 流水线自己的两个字段（2026-09-03）。它们一直被校验、迁移、克隆、渲染，
+          // 却**没有任何动词写得进去**——三个字段里 cardKey 归看板自己生成，
+          // 另外两个是各阶段之间唯一的交接口：
+          //   specPath     —— Spec authoring 写下规格文件的位置，Decompose 读它。
+          //   laneBranches —— Decompose 建好 worktree 后写下路径，Build/Verify/Review
+          //                   共用同一个，Merge 清理。缺了它，per-stage 的各阶段
+          //                   之间就没有交接口，只能靠猜路径。
+          // 空字符串 / 空数组是显式清除，这样 Merge 收尾时能把 lane 交还。
+          if (typeof a.specPath === 'string') card.state.specPath = a.specPath || null
+          if (Array.isArray(a.laneBranches)) {
+            card.state.laneBranches = a.laneBranches.filter((b) => typeof b === 'string' && b)
+          }
           const after = {
             title: card.title,
             note: card.note,
             label: card.label ?? null,
             priority: card.priority ?? null,
+            specPath: card.state.specPath ?? null,
+            laneBranches: card.state.laneBranches.join(','),
           }
           if (after.title !== before.title) {
             record(board, { cardId: card.id, type: 'card_title_changed', source: actor, field: 'title', from: before.title, to: after.title })
@@ -993,6 +1030,14 @@ export function apply(ctx) {
           }
           if (after.priority !== before.priority) {
             record(board, { cardId: card.id, type: 'card_priority_changed', source: actor, field: 'priority', from: before.priority, to: after.priority })
+          }
+          // 这两个字段是阶段之间的交接口，改动必须留痕：worktree 被谁换掉、
+          // 规格文件被指到哪里，是事后复盘"卡片为什么找不到自己的代码"的唯一线索。
+          if (after.specPath !== before.specPath) {
+            record(board, { cardId: card.id, type: 'card_spec_path_changed', source: actor, field: 'specPath', from: before.specPath, to: after.specPath })
+          }
+          if (after.laneBranches !== before.laneBranches) {
+            record(board, { cardId: card.id, type: 'card_lanes_changed', source: actor, field: 'laneBranches', from: before.laneBranches || null, to: after.laneBranches || null })
           }
           await save(workspace, session)
         }
@@ -1056,6 +1101,36 @@ export function apply(ctx) {
         if (!reason) return result({ error: 'A bounce reason is required; it is the next run\'s primary input' })
         const fromCol = findColumn(board, card.columnId)
         const fromTitle = fromCol ? fromCol.title : String(card.columnId)
+        // 退回必须真的**向后**（2026-09-03，实测发现）。原先只解析目标列，不看方向，
+        // 于是 bounce(Spec -> Review) 会成功：跨过 4 个阶段、没有任何证据、还被记成
+        // 一次 bounce。那是一次伪装成退回的**晋升**——promote 有 finalize 的流水线
+        // 步进和证据要求把关，而 bounce 这条路把它们全绕开了。
+        // 六个阶段的 per-stage 设计让这件事从"理论上难看"变成"随时会发生"：每个
+        // tick 只看得见自己那一列，写错 toStage 就是静默跳级。
+        // 向后可以跨多列（工具描述明写 "one or more stages"，Review->Spec 是合法的）；
+        // 同列不动（bounce 到自己所在的列没有意义，但也不破坏什么，仍然拒绝以免
+        // 计数器被无意义地推高）。Blocked / Archive 不在流水线上，用 finalize 的
+        // blocked 结局或人工移动处理，这里一律拒绝。
+        const fromIdx = PIPELINE_STAGES.indexOf(fromTitle)
+        const toIdx = PIPELINE_STAGES.indexOf(target.title)
+        if (fromIdx < 0) {
+          return result({
+            error: 'Cannot bounce ' + id + ' from ' + fromTitle + ': it is not a pipeline stage.',
+          })
+        }
+        if (toIdx < 0) {
+          return result({
+            error: 'Cannot bounce ' + id + ' to ' + target.title + ': it is not a pipeline stage. ' +
+              'To park a card use the blocked outcome, not a bounce.',
+          })
+        }
+        if (toIdx >= fromIdx) {
+          return result({
+            error: 'A bounce must move BACKWARD: ' + fromTitle + ' -> ' + target.title +
+              ' is ' + (toIdx === fromIdx ? 'the same stage' : 'forward') +
+              '. Forward movement is a promote and requires evidence.',
+          })
+        }
         const edge = fromTitle + '->' + target.title
         const st = card.state
         card.columnId = target.id
@@ -1224,6 +1299,25 @@ export function apply(ctx) {
           if (!target) return result({ error: 'Unknown target stage: ' + str(a.toStage, '') })
           const reason = str(a.reason, '')
           if (!reason) return result({ error: 'A bounce reason is required; it is the next run\'s primary input' })
+          // 与 bounceCard 同一条方向约束，而且这条路更要紧：finalize 是**权威**的
+          // 收尾路径，tick 用它来对账上一轮 dispatch 的阶段。少了这个检查，
+          // finalize(outcome:'bounce', toStage:<前面的阶段>) 就是一次绕过 promote
+          // 全部证据要求的晋升，还会被记进 bounce 计数里。
+          const fromIdxB = PIPELINE_STAGES.indexOf(fromTitle)
+          const toIdxB = PIPELINE_STAGES.indexOf(target.title)
+          if (fromIdxB < 0 || toIdxB < 0) {
+            return result({
+              error: 'Cannot bounce ' + id + ' ' + fromTitle + ' -> ' + target.title +
+                ': both must be pipeline stages. To park a card use outcome=blocked.',
+            })
+          }
+          if (toIdxB >= fromIdxB) {
+            return result({
+              error: 'A bounce must move BACKWARD: ' + fromTitle + ' -> ' + target.title +
+                ' is ' + (toIdxB === fromIdxB ? 'the same stage' : 'forward') +
+                '. Forward movement is a promote and requires evidence.',
+            })
+          }
           const edge = fromTitle + '->' + target.title
           st.bounceCount += 1
           st.bouncesByEdge[edge] = (st.bouncesByEdge[edge] || 0) + 1
@@ -1926,6 +2020,8 @@ export function apply(ctx) {
           note: { type: 'string', description: 'New note (optional)' },
           label: { type: 'string', description: 'New label name (optional); must already exist on the board (see kanban_add_label), an unknown name is rejected; pass empty string to clear' },
           priority: { type: 'string', enum: ['high', 'medium', 'low', ''], description: 'New priority (optional): high=P0 / medium=P1 / low=P2; pass empty string to clear' },
+          specPath: { type: 'string', description: "Path to this card's spec file (optional). The Spec stage writes it; later stages read it. Pass empty string to clear." },
+          laneBranches: { type: 'array', items: { type: 'string' }, description: "This card's worktree/branch lanes (optional). Decompose records the lane it created; Build/Verify/Review reuse it; Merge clears it. Replaces the whole list; pass [] to clear." },
         },
         ['id'],
       ),
