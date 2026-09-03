@@ -580,6 +580,109 @@ describe("host board seam", () => {
     expect(healthy.card.state.owner).toBe("live-run")
   })
 
+  // k311: promote must walk the PIPELINE (six working stages), not the eight
+  // reserved titles. RESERVED_STAGE_TITLES is a storage list in which Blocked and
+  // Archive merely sit at the end, so idx+1 promoted Merge INTO Blocked and
+  // Blocked into Archive. Merge is the pipeline's success terminus, so the first
+  // card ever to complete the flow landed in the blocked pile — logged as a
+  // legitimate promote, with no reason recorded. No human error required.
+  it("promotes along the pipeline: Merge exits to Archive, never into Blocked", async () => {
+    const { registered, exec } = boot()
+    const add = await tool(registered, "kanban_add_card").execute({ title: "Walks the ladder" }, exec)
+    const id = add.board.cards[0].id
+    const claim = tool(registered, "kanban_claim_card")
+    const dispatch = tool(registered, "kanban_dispatch_card")
+    const finalize = tool(registered, "kanban_finalize_card")
+
+    const titleOf = (res) => {
+      const card = res.board.cards.find((c) => c.id === id)
+      return res.board.columns.find((c) => c.id === card.columnId).title
+    }
+
+    // The six ordinary steps still work, in order.
+    for (const stage of ["Spec", "Decompose", "Build", "Verify", "Review"]) {
+      await claim.execute({ id, ownerRunId: "run-" + stage }, exec)
+      await dispatch.execute({ id, stage, teamName: "t" }, exec)
+      const res = await finalize.execute({ id, stage, outcome: "promote" }, exec)
+      expect(res.ok, `promote from ${stage}`).toBe(true)
+    }
+    // Now in Merge — the success terminus. THE BUG: this used to land in Blocked.
+    await claim.execute({ id, ownerRunId: "run-merge" }, exec)
+    await dispatch.execute({ id, stage: "Merge", teamName: "t" }, exec)
+    const merged = await finalize.execute({ id, stage: "Merge", outcome: "promote" }, exec)
+    expect(merged.ok).toBe(true)
+    expect(titleOf(merged), "a merged card must not be promoted into Blocked").toBe("Archive")
+  })
+
+  it("refuses to promote a card parked in Blocked", async () => {
+    const { registered, exec } = boot()
+    const add = await tool(registered, "kanban_add_card").execute({ title: "Parked" }, exec)
+    const id = add.board.cards[0].id
+    await tool(registered, "kanban_claim_card").execute({ id, ownerRunId: "run-a" }, exec)
+    await tool(registered, "kanban_dispatch_card").execute({ id, stage: "Spec", teamName: "t" }, exec)
+    const parked = await tool(registered, "kanban_finalize_card")
+      .execute({ id, stage: "Spec", outcome: "blocked", reason: "upstream API is down" }, exec)
+    expect(parked.ok).toBe(true)
+
+    // A blocked card is unparked by a human or bounced — never promoted.
+    await tool(registered, "kanban_claim_card").execute({ id, ownerRunId: "run-b" }, exec)
+    await tool(registered, "kanban_dispatch_card").execute({ id, stage: "Blocked", teamName: "t" }, exec)
+    const res = await tool(registered, "kanban_finalize_card")
+      .execute({ id, stage: "Blocked", outcome: "promote" }, exec)
+    expect(res.ok).toBe(false)
+    expect(res.message).toContain("not a pipeline stage")
+  })
+
+  // k179 (decision (ii), 2026-09-03): a human drag is ALWAYS allowed — refusing it
+  // would be the transition guard plan:710 rejects. But moving a card to another
+  // STAGE clears the claim, so the agent's finalize is rejected through the
+  // existing "lost" path instead of silently promoting from the card's new column.
+  it("clears the claim when a human moves a claimed card to another stage", async () => {
+    const { registered, exec, workspace } = boot()
+    const add = await tool(registered, "kanban_add_card").execute({ title: "Contested" }, exec)
+    const id = add.board.cards[0].id
+    await tool(registered, "kanban_claim_card").execute({ id, ownerRunId: "run-a" }, exec)
+    await tool(registered, "kanban_dispatch_card").execute({ id, stage: "Spec", teamName: "team-1" }, exec)
+
+    const build = add.board.columns.find((c) => c.title === "Build").id
+    const moved = await tool(registered, "kanban_move_card").execute({ id, columnId: build }, exec)
+    expect(moved.ok).toBe(true)
+    expect(moved.message).toContain("released the claim")
+
+    const after = await tool(registered, "kanban_get_card").execute({ id }, exec)
+    expect(after.card.state.owner).toBe(null)
+    expect(after.card.state.dispatched).toBe(null)
+
+    // THE POINT: the agent's finalize is now rejected as lost, rather than
+    // promoting from Build (where the human put it) as if it had worked there.
+    const late = await tool(registered, "kanban_finalize_card")
+      .execute({ id, stage: "Spec", ownerRunId: "run-a", outcome: "promote" }, exec)
+    expect(late.ok).toBe(false)
+    expect(late.message).toContain("finalize lost")
+    expect(workspace).toBeTruthy()
+  })
+
+  // A same-column REORDER is not a stage change: the team is still working the
+  // same stage, so destroying its claim because a human tidied the column order
+  // would burn live work for nothing.
+  it("preserves the claim when a human reorders within the same column", async () => {
+    const { registered, exec } = boot()
+    await tool(registered, "kanban_add_card").execute({ title: "first" }, exec)
+    const second = await tool(registered, "kanban_add_card").execute({ title: "second" }, exec)
+    const id = second.board.cards[1].id
+    const spec = second.board.columns.find((c) => c.title === "Spec").id
+    await tool(registered, "kanban_claim_card").execute({ id, ownerRunId: "run-a" }, exec)
+    await tool(registered, "kanban_dispatch_card").execute({ id, stage: "Spec", teamName: "team-1" }, exec)
+
+    const moved = await tool(registered, "kanban_move_card").execute({ id, columnId: spec, toIndex: 0 }, exec)
+    expect(moved.ok).toBe(true)
+    expect(moved.message).not.toContain("released the claim")
+
+    const after = await tool(registered, "kanban_get_card").execute({ id }, exec)
+    expect(after.card.state.owner, "a reorder must not steal a live claim").toBe("run-a")
+    expect(after.card.state.dispatched).toMatchObject({ stage: "Spec", teamName: "team-1" })
+  })
+
   // k183: a DISPATCHED card keeps its claim by design, because the team outlives
   // the run that started it — so nothing can ever refresh its heartbeat and the
   // clock is not a valid staleness signal for it. Before this, any team slower

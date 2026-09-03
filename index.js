@@ -851,7 +851,13 @@ export function apply(ctx) {
   // 单卡克隆：动词返回被改动的那张卡，调用方无需再拉整块看板。
   const cloneCard = (card) => cloneBoard({ columns: [], labels: [], cards: [card], activities: [] }).cards[0]
   // 六个真实阶段——Blocked 和 Archive 不是工作队列，就绪列表永远不返回它们。
-  const WORKING_STAGES = new Set(RESERVED_STAGE_TITLES.filter((t) => t !== 'Blocked' && t !== 'Archive'))
+  // PIPELINE_STAGES 是有序的流水线；WORKING_STAGES 是它的集合形式，用于成员判断。
+  // 两者从同一个过滤器派生，绝不要各写一份：promote 原先直接在
+  // RESERVED_STAGE_TITLES 上做 idx+1，而那是一个**存储清单**（八列，Blocked 和
+  // Archive 只是恰好排在末尾），不是流水线。于是 Merge 会被"晋升"进 Blocked，
+  // Blocked 会被"晋升"进 Archive——k311。判断依据本来就在这里，只是没人去查。
+  const PIPELINE_STAGES = RESERVED_STAGE_TITLES.filter((t) => t !== 'Blocked' && t !== 'Archive')
+  const WORKING_STAGES = new Set(PIPELINE_STAGES)
   const OUTCOMES = new Set(['promote', 'bounce', 'blocked'])
   const summaryOfClone = (clone) => ({
     columns: clone.columns.map((c) => ({
@@ -1198,9 +1204,20 @@ export function apply(ctx) {
         const fromTitle = fromCol ? fromCol.title : String(card.columnId)
         let target = fromCol
         if (outcome === 'promote') {
-          const idx = RESERVED_STAGE_TITLES.indexOf(fromTitle)
-          const nextTitle = idx >= 0 ? RESERVED_STAGE_TITLES[idx + 1] : null
-          target = nextTitle ? board.columns.find((c) => c.title === nextTitle) : null
+          // 晋升只沿**流水线**走，不沿存储清单走（k311）。
+          const idx = PIPELINE_STAGES.indexOf(fromTitle)
+          // Blocked / Archive 不在流水线上：停在那里的卡由人来解封或退回，
+          // 绝不是"晋升"的对象。原先 Blocked 会被一路晋升进 Archive。
+          if (idx < 0) {
+            return result({
+              error: 'Cannot promote ' + id + ' from ' + fromTitle +
+                ': it is not a pipeline stage. Move it back to a working stage first.',
+            })
+          }
+          // Merge 是流水线的出口。计划 §4.6 说合并完成的卡进入显式的 Archive 列，
+          // 所以这一步是**刻意**跨过去的，而不是 idx+1 顺手滑进 Blocked。
+          const nextTitle = idx + 1 < PIPELINE_STAGES.length ? PIPELINE_STAGES[idx + 1] : 'Archive'
+          target = board.columns.find((c) => c.title === nextTitle) || null
           if (!target) return result({ error: 'Cannot promote ' + id + ' beyond ' + fromTitle })
         } else if (outcome === 'bounce') {
           target = findColumn(board, str(a.toStage, '')) || board.columns.find((c) => c.title === str(a.toStage, ''))
@@ -1279,11 +1296,42 @@ export function apply(ctx) {
         const anchor = inCol[toIndex]
         if (anchor) board.cards.splice(board.cards.indexOf(anchor), 0, card)
         else board.cards.push(card)
-        if (fromTitle !== target.title) {
+        // 换列（而不是同列内重排）会**解除认领**——k179 决策 2026-09-03，选项 (ii)。
+        //
+        // 人拖卡永远是允许的：计划 :710 明确拒绝在插件里加转移守卫（那正是
+        // dsh-kanban-flow 走错的地方），:435 划下的线是"守住看板结构可以，管束卡片
+        // 移动不行"。所以这里不拒绝，只是把所有权记账改对：卡片换了阶段，原来那个
+        // agent 就不再是它的主人。
+        //
+        // 这样做便宜，是因为 finalizeCard 本来就有"认领已失效"的语义（dispatched 为空、
+        // 阶段对不上、ownerRunId 对不上都会被拒）。清掉认领等于把人工拖动引流进那条
+        // 已有且已测的路径，而不是在接缝上新发明第四种行为。否则 finalize 的比较是拿
+        // dispatched.stage 对的，人拖动并不会清掉 dispatched，于是它照样匹配成功，
+        // 然后从卡片**当前**所在列去算晋升——静默地从错误的阶段提升。
+        //
+        // 同列内重排**不动认领**：卡片所处的阶段没变，正在跑的团队做的还是同一件事，
+        // 仅仅因为人调了一下顺序就废掉在跑的工作是纯粹的损失。
+        //
+        // 代价，明写：清认领并不会让团队停下来。工作照跑，只是落地时会被拒——所以会
+        // 白烧一轮，且存在一个"团队正在为一张已经被搬走的卡干活"的窗口。这比静默地
+        // 从错误阶段晋升好，但不是免费的；而这个接缝上没有任何选项能停下团队。
+        const changedStage = fromTitle !== target.title
+        const lostFrom = changedStage ? card.state.owner : null
+        if (lostFrom) {
+          card.state.owner = null
+          card.state.ownerRunId = null
+          card.state.dispatched = null
+          card.state.heartbeatAt = null
+          record(board, { cardId: card.id, type: 'card_claim_released', source: actor, meta: { title: card.title, owner: lostFrom, from: fromTitle, to: target.title } })
+        }
+        if (changedStage) {
           record(board, { cardId: card.id, type: 'card_moved', source: actor, field: 'columnId', from: fromTitle, to: target.title, meta: { title: card.title } })
         }
         await save(workspace, session)
-        return result({ message: 'Moved to "' + target.title + '"' })
+        return result({
+          message: 'Moved to "' + target.title + '"' +
+            (lostFrom ? ' — released the claim held by ' + lostFrom + '; its finalize will be rejected as lost' : ''),
+        })
       }
 
       case 'addColumn': {
