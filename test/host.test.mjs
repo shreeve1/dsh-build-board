@@ -660,6 +660,60 @@ describe("host board seam", () => {
     expect(badCard.message).toContain("Card not found: nope")
     expect(badColumn.message).toContain("Unknown target list: Nonsense")
     expect(badCard.message, "two independent causes must not share one message").not.toBe(badColumn.message)
+
+    // The move must actually PERSIST, not merely report success — the fix touches
+    // the resolution step that runs before the write, so a title that resolved but
+    // wrote nowhere would still satisfy every assertion above.
+    const landed = await tool(registered, "kanban_get_card").execute({ id: byTitle }, exec)
+    const buildCol = titleMove.board.columns.find((c) => c.title === "Build")
+    expect(landed.card.columnId).toBe(buildCol.id)
+  })
+
+  // k226 was not really "moveCard is missing a fallback" — it was that ONE of the
+  // four stage-taking verbs diverged from the other three, and nothing detected the
+  // divergence. Fixing only moveCard leaves that hole open, so the shared property
+  // is asserted across all four here. If a fifth verb is added, or one of these
+  // drifts back to id-only, this fails instead of waiting for someone to hit it by
+  // hand the way k226 was originally found.
+  it("accepts a stage TITLE in every verb that takes a stage", async () => {
+    const { registered, exec } = boot()
+    const add = tool(registered, "kanban_add_card")
+    const newCard = async (title) => (await add.execute({ title }, exec)).board.cards.find((c) => c.title === title).id
+
+    expect(await tool(registered, "kanban_move_card").execute({ id: await newCard("m1"), columnId: "Build" }, exec))
+      .toMatchObject({ ok: true })
+
+    const bounceId = await newCard("b1")
+    await tool(registered, "kanban_move_card").execute({ id: bounceId, columnId: "Verify" }, exec)
+    expect(await tool(registered, "kanban_bounce_card")
+      .execute({ id: bounceId, toStage: "Build", reason: "probe: gate exited 1" }, exec)).toMatchObject({ ok: true })
+
+    const finalId = await newCard("f1")
+    await tool(registered, "kanban_claim_card").execute({ id: finalId, ownerRunId: "run-c" }, exec)
+    await tool(registered, "kanban_dispatch_card").execute({ id: finalId, stage: "Spec", teamName: "t" }, exec)
+    expect(await tool(registered, "kanban_finalize_card")
+      .execute({ id: finalId, stage: "Spec", outcome: "bounce", toStage: "Spec", reason: "probe: failing check" }, exec))
+      .toMatchObject({ ok: true })
+
+    const ready = await tool(registered, "kanban_ready_cards").execute({ column: "Build" }, exec)
+    expect(ready.ok).toBe(true)
+    expect(ready.cards.length).toBeGreaterThan(0)
+
+    // And every one of them must NAME the offending stage rather than answering
+    // with a generic string — the second half of k226, which cost the round trip.
+    for (const [name, args] of [
+      ["kanban_move_card", { id: await newCard("x1"), columnId: "Zzz" }],
+      ["kanban_bounce_card", { id: await newCard("x2"), toStage: "Zzz", reason: "probe: r" }],
+    ]) {
+      const res = await tool(registered, name).execute(args, exec)
+      expect(res.ok, `${name} must refuse an unknown stage`).toBe(false)
+      expect(res.message, `${name} must name the bad stage`).toContain("Zzz")
+    }
+
+    // The documented contract must agree too: a caller reads the schema, not the code.
+    expect(tool(registered, "kanban_move_card").parameters.properties.columnId.description).toContain("id or title")
+    expect(tool(registered, "kanban_bounce_card").parameters.properties.toStage.description).toContain("id or title")
+    expect(tool(registered, "kanban_ready_cards").parameters.properties.column.description).toContain("id or title")
   })
 
   // k179 (decision (ii), 2026-09-03): a human drag is ALWAYS allowed — refusing it
