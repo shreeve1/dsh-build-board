@@ -1068,10 +1068,44 @@ export function apply(ctx) {
 
       // 回收：释放心跳过期的认领。这是崩溃残留的清扫，而崩溃残留是通宵循环的常态。
       // 不提升、不判定成败——只把卡片还回池子，由下一轮重新决定。
+      // 回收有两条互相独立的分支，因为"过期"有两种完全不同的含义（k183 决策 2026-09-03）。
+      //
+      // 分支一，存活性（权威）：调用方交来一份"此刻还活着的 run"快照，owner 不在其中
+      // 才回收。插件自己**查不到**这件事——它拿到的服务只有 fs / sandboxPolicy /
+      // workspaceRegistry / webServer，够不着 dsh-cron；而 cron 的 runs 表是会被 GC
+      // 剪掉的（实测此刻 runs 为空，却有已排期的任务）。所以"在历史里查不到"绝不等于
+      // "已经死了"，据此回收等于换个由头继续抢卡。这份事实只能由调用方担保。
+      //
+      // 分支二，时钟（推测）：只是"很久没有心跳了"。它**跳过已 dispatch 的卡**——
+      // dispatch 之后团队比发起它的 run 活得更久（这正是 outcome D 的设计），能续心跳的
+      // 那个 run 早就退出了，所以对这些卡而言时钟根本不是有效信号。原先没跳过，于是
+      // 任何跑得比阈值慢的团队都会被确定性地夺走卡，第三次 tick 再为同一阶段派出第二个团队。
       case 'reap': {
         const seconds = Number(a.staleAfterSeconds)
         if (!Number.isFinite(seconds) || seconds <= 0) {
           return result({ error: 'staleAfterSeconds must be a positive number' })
+        }
+        // 快照的完整性契约。仅仅"没出现在列表里"不构成"不存在"：一份过期的快照必然
+        // 漏掉它拍摄之后才启动的 run，照此回收就会夺走一个刚刚建立、完全健康的认领。
+        // 所以 liveRunIds 必须同时带上拍摄时刻 liveRunsAsOf，并且只对**早于**该时刻
+        // 建立的认领生效——晚于它的认领不可能出现在快照里，无从判断，一律不动。
+        // 缺参数、类型不对、时间戳无法解析：一律拒绝整次调用（fail closed），
+        // 绝不降级成"就当没传存活性列表"——那会让一次拼错的调用静默退回纯时钟回收。
+        const hasLive = a.liveRunIds !== undefined || a.liveRunsAsOf !== undefined
+        let liveSet = null
+        let asOf = NaN
+        if (hasLive) {
+          if (!Array.isArray(a.liveRunIds) || a.liveRunIds.some((id) => typeof id !== 'string' || !id)) {
+            return result({ error: 'liveRunIds must be an array of non-empty run id strings' })
+          }
+          if (typeof a.liveRunsAsOf !== 'string' || !Number.isFinite(Date.parse(a.liveRunsAsOf))) {
+            return result({
+              error: 'liveRunsAsOf must be an ISO timestamp naming when the liveRunIds snapshot was taken; ' +
+                'without it an omission cannot be distinguished from a run that started after the snapshot',
+            })
+          }
+          liveSet = new Set(a.liveRunIds)
+          asOf = Date.parse(a.liveRunsAsOf)
         }
         const cutoff = Date.now() - seconds * 1000
         const released = []
@@ -1079,14 +1113,26 @@ export function apply(ctx) {
           const st = card.state
           if (!st.owner) continue
           const beat = st.heartbeatAt ? Date.parse(st.heartbeatAt) : NaN
-          if (Number.isFinite(beat) && beat >= cutoff) continue
-          released.push({ id: card.id, owner: st.owner, heartbeatAt: st.heartbeatAt })
-          st.lastBounceReason = 'reaped: owning run ' + st.owner + ' went stale before writing an exit'
+          // 存活性分支优先：它是事实，时钟只是推测。
+          const olderThanSnapshot = Number.isFinite(beat) && beat < asOf
+          const provablyDead = liveSet !== null && olderThanSnapshot && !liveSet.has(st.owner)
+          let reason
+          if (provablyDead) {
+            reason = 'reaped: owning run ' + st.owner + ' was not among the live runs reported at ' + a.liveRunsAsOf
+          } else if (!st.dispatched && (!Number.isFinite(beat) || beat < cutoff)) {
+            // 措辞刻意不说"已经死了"——这一支并不知道。它只知道心跳旧了。
+            reason = 'reaped: no heartbeat from owning run ' + st.owner + ' for over ' + seconds +
+              's and its liveness was not reported'
+          } else {
+            continue
+          }
+          released.push({ id: card.id, owner: st.owner, heartbeatAt: st.heartbeatAt, basis: provablyDead ? 'run-not-live' : 'heartbeat-expired' })
+          st.lastBounceReason = reason
           st.owner = null
           st.ownerRunId = null
           st.dispatched = null
           st.heartbeatAt = null
-          record(board, { cardId: card.id, type: 'card_reaped', source: actor, meta: { title: card.title, owner: released[released.length - 1].owner } })
+          record(board, { cardId: card.id, type: 'card_reaped', source: actor, meta: { title: card.title, owner: released[released.length - 1].owner, basis: released[released.length - 1].basis } })
         }
         if (released.length > 0) await save(workspace, session)
         return result({ message: 'Reaped ' + released.length + ' stale claim(s)', released })
@@ -1895,9 +1941,13 @@ export function apply(ctx) {
     },
     {
       name: 'kanban_reap',
-      description: 'Release claims whose heartbeat is older than staleAfterSeconds — the crash-residue pass for an unattended loop. Reaped cards are returned to the pool with a reason recorded; they are never promoted, because the run that would have produced the evidence is gone.',
+      description: 'Release claims whose owning run is gone — the crash-residue pass for an unattended loop. Prefer the authoritative form: pass liveRunIds (every run id currently alive) together with liveRunsAsOf (when that snapshot was taken), and a claim is released only when its owner is absent from a snapshot taken AFTER the claim was made. Without those, only a weaker heartbeat-expiry pass runs, and it deliberately SKIPS dispatched cards, because a dispatched team outlives the run that started it and nothing can refresh its heartbeat. Reaped cards are returned to the pool with a reason recorded; they are never promoted, because the run that would have produced the evidence is gone.',
       parameters: params(
-        { staleAfterSeconds: { type: 'integer', description: 'Release claims whose heartbeat is older than this many seconds' } },
+        {
+          staleAfterSeconds: { type: 'integer', description: 'Heartbeat-expiry fallback: release an UNDISPATCHED claim whose heartbeat is older than this many seconds' },
+          liveRunIds: { type: 'array', items: { type: 'string' }, description: 'COMPLETE list of run ids alive at liveRunsAsOf (e.g. every cron_runs entry with status "running"). Must be exhaustive: an omission is read as "that run is gone". Requires liveRunsAsOf.' },
+          liveRunsAsOf: { type: 'string', description: 'ISO timestamp when the liveRunIds snapshot was taken. Claims made after this instant are never reaped by liveness, since they could not have appeared in the snapshot. Requires liveRunIds.' },
+        },
         ['staleAfterSeconds'],
       ),
       output: output(renderBoard),

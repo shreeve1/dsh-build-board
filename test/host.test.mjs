@@ -580,6 +580,94 @@ describe("host board seam", () => {
     expect(healthy.card.state.owner).toBe("live-run")
   })
 
+  // k183: a DISPATCHED card keeps its claim by design, because the team outlives
+  // the run that started it — so nothing can ever refresh its heartbeat and the
+  // clock is not a valid staleness signal for it. Before this, any team slower
+  // than the threshold had its card stolen deterministically, and a later tick
+  // dispatched a SECOND team for the same stage.
+  it("never reaps a dispatched card on the clock alone", async () => {
+    const { dir, registered, exec } = boot()
+    const add = await tool(registered, "kanban_add_card").execute({ title: "Long build" }, exec)
+    const id = add.board.cards[0].id
+    await tool(registered, "kanban_claim_card").execute({ id, ownerRunId: "run-a" }, exec)
+    await tool(registered, "kanban_dispatch_card").execute({ id, stage: "Build", teamName: "team-1" }, exec)
+
+    // Age the heartbeat far past any threshold: the team is simply slow.
+    const onDisk = JSON.parse(readFileSync(boardPath(dir), "utf8"))
+    onDisk.cards.find((c) => c.id === id).state.heartbeatAt = "2020-01-01T00:00:00.000Z"
+    seedBoard(dir, JSON.stringify(onDisk))
+    const reloaded = boot(dir)
+
+    const reaped = await tool(reloaded.registered, "kanban_reap").execute({ staleAfterSeconds: 60 }, reloaded.exec)
+    expect(reaped.message).toContain("0 stale claim")
+    const card = await tool(reloaded.registered, "kanban_get_card").execute({ id }, reloaded.exec)
+    expect(card.card.state.owner, "a slow team must not have its card stolen").toBe("run-a")
+    expect(card.card.state.dispatched).toMatchObject({ stage: "Build", teamName: "team-1" })
+  })
+
+  // The authoritative branch: absence from a COMPLETE live-run snapshot is a fact
+  // the caller vouches for, so it reaps even a dispatched card.
+  it("reaps a dispatched card when its run is absent from a live-run snapshot", async () => {
+    const { registered, exec } = boot()
+    const add = await tool(registered, "kanban_add_card").execute({ title: "Orphaned build" }, exec)
+    const id = add.board.cards[0].id
+    await tool(registered, "kanban_claim_card").execute({ id, ownerRunId: "dead-run" }, exec)
+    await tool(registered, "kanban_dispatch_card").execute({ id, stage: "Build", teamName: "team-x" }, exec)
+
+    const reaped = await tool(registered, "kanban_reap").execute({
+      staleAfterSeconds: 86400,
+      liveRunIds: ["some-other-run"],
+      liveRunsAsOf: new Date(Date.now() + 1000).toISOString(),
+    }, exec)
+    expect(reaped.message).toContain("1 stale claim")
+    expect(reaped.released[0].basis).toBe("run-not-live")
+    const card = await tool(registered, "kanban_get_card").execute({ id }, exec)
+    expect(card.card.state.owner).toBe(null)
+    // The reason must name the evidence, and must NOT claim the run "went stale".
+    expect(card.card.state.lastBounceReason).toContain("not among the live runs")
+  })
+
+  // THE SNAPSHOT RACE. A claim made AFTER the snapshot was taken could not
+  // possibly have appeared in it, so its absence proves nothing. Reaping it would
+  // steal a brand-new, perfectly healthy claim — the same theft this card fixes,
+  // just sourced from a stale snapshot instead of a clock.
+  it("never reaps a claim newer than the live-run snapshot", async () => {
+    const { registered, exec } = boot()
+    const add = await tool(registered, "kanban_add_card").execute({ title: "Just claimed" }, exec)
+    const id = add.board.cards[0].id
+    const snapshotAt = new Date(Date.now() - 60_000).toISOString()
+    // Claimed now, i.e. a full minute after the snapshot was taken.
+    await tool(registered, "kanban_claim_card").execute({ id, ownerRunId: "brand-new-run" }, exec)
+
+    const reaped = await tool(registered, "kanban_reap").execute({
+      staleAfterSeconds: 86400,
+      liveRunIds: [],
+      liveRunsAsOf: snapshotAt,
+    }, exec)
+    expect(reaped.message).toContain("0 stale claim")
+    const card = await tool(registered, "kanban_get_card").execute({ id }, exec)
+    expect(card.card.state.owner, "a claim newer than the snapshot must survive").toBe("brand-new-run")
+  })
+
+  // Fail closed: a half-supplied or malformed snapshot must REFUSE, never silently
+  // degrade to the weaker clock pass. A typo'd argument must not quietly change
+  // which policy runs.
+  it("refuses a liveness snapshot that cannot be trusted", async () => {
+    const { registered, exec } = boot()
+    const reap = tool(registered, "kanban_reap")
+    const bad = [
+      { staleAfterSeconds: 60, liveRunIds: ["a"] },
+      { staleAfterSeconds: 60, liveRunsAsOf: new Date().toISOString() },
+      { staleAfterSeconds: 60, liveRunIds: "a", liveRunsAsOf: new Date().toISOString() },
+      { staleAfterSeconds: 60, liveRunIds: ["a", ""], liveRunsAsOf: new Date().toISOString() },
+      { staleAfterSeconds: 60, liveRunIds: ["a"], liveRunsAsOf: "not-a-date" },
+    ]
+    for (const args of bad) {
+      const res = await reap.execute(args, exec)
+      expect(res.ok, `must refuse: ${JSON.stringify(args)}`).toBe(false)
+    }
+  })
+
   it("lists only unowned cards in working stages as ready", async () => {
     const { registered, exec } = boot()
     const a = await tool(registered, "kanban_add_card").execute({ title: "Free" }, exec)
