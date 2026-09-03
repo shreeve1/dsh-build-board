@@ -633,6 +633,35 @@ describe("host board seam", () => {
     expect(res.message).toContain("not a pipeline stage")
   })
 
+  // k226: three of the four stage-taking verbs accept a stage TITLE; moveCard
+  // accepted only an id, and answered "Card or list not found" for both possible
+  // causes. The last assertion is the one that would have saved a round trip: the
+  // natural reading of that string sent me to check the card list when the card
+  // was fine and only the column argument's FORM was wrong.
+  it("moves by stage title as well as id, and says which argument was wrong", async () => {
+    const { registered, exec } = boot()
+    const move = tool(registered, "kanban_move_card")
+    const add = tool(registered, "kanban_add_card")
+    const byTitle = (await add.execute({ title: "By title" }, exec)).board.cards[0].id
+    const byId = (await add.execute({ title: "By id" }, exec)).board.cards.find((c) => c.title === "By id").id
+
+    const titleMove = await move.execute({ id: byTitle, columnId: "Build" }, exec)
+    expect(titleMove, "a stage title must work here as it does in bounce/finalize").toMatchObject({
+      ok: true,
+      message: 'Moved to "Build"',
+    })
+
+    // The id form must keep working — this is an added fallback, not a swap.
+    const buildId = titleMove.board.columns.find((c) => c.title === "Build").id
+    expect(await move.execute({ id: byId, columnId: buildId }, exec)).toMatchObject({ ok: true, message: 'Moved to "Build"' })
+
+    const badCard = await move.execute({ id: "nope", columnId: "Build" }, exec)
+    const badColumn = await move.execute({ id: byId, columnId: "Nonsense" }, exec)
+    expect(badCard.message).toContain("Card not found: nope")
+    expect(badColumn.message).toContain("Unknown target list: Nonsense")
+    expect(badCard.message, "two independent causes must not share one message").not.toBe(badColumn.message)
+  })
+
   // k179 (decision (ii), 2026-09-03): a human drag is ALWAYS allowed — refusing it
   // would be the transition guard plan:710 rejects. But moving a card to another
   // STAGE clears the claim, so the agent's finalize is rejected through the
@@ -1180,6 +1209,57 @@ describe("host board seam", () => {
     expect(textAfter, "the claimed card must not be listed as ready").not.toContain(highId)
     expect(textAfter).toContain("medium card")
     expect(textAfter).toContain("low card")
+  })
+
+  // k386, instances two and three of the k254 pattern: a verb computes the right
+  // answer, puts it in the result object, and the renderer never reads it. BOTH
+  // assertions below MUST be render-level — a result-object assertion passed the
+  // whole time for both, which is exactly why this survived two rounds.
+  it("renders the state block of a claimed / dispatched card in get_card", async () => {
+    const { registered, exec } = boot()
+    const add = await tool(registered, "kanban_add_card").execute({ title: "Owned card" }, exec)
+    const id = add.board.cards[0].id
+    const getCard = tool(registered, "kanban_get_card")
+
+    // An unclaimed card must say so rather than printing a misleading blank.
+    const clean = await getCard.execute({ id }, exec)
+    expect(getCard.output.render({}, clean)[0].text).toContain("State: unclaimed")
+
+    await tool(registered, "kanban_claim_card").execute({ id, ownerRunId: "run-77" }, exec)
+    await tool(registered, "kanban_dispatch_card").execute({ id, stage: "Spec", teamName: "team-9" }, exec)
+
+    const held = await getCard.execute({ id }, exec)
+    const text = getCard.output.render({}, held)[0].text
+    // "Who owns this card" is the single most operationally important question a
+    // tick asks, and it was answerable only by reading board.json directly.
+    expect(text, "the owner must be visible through the tool").toContain("run-77")
+    expect(text).toContain("dispatched: Spec")
+    expect(text).toContain("team-9")
+  })
+
+  it("renders which claims reap released, and on what basis", async () => {
+    const { registered, exec } = boot()
+    const add = tool(registered, "kanban_add_card")
+    const dead = (await add.execute({ title: "Dead run card" }, exec)).board.cards[0].id
+    await tool(registered, "kanban_claim_card").execute({ id: dead, ownerRunId: "dead-run" }, exec)
+    await tool(registered, "kanban_dispatch_card").execute({ id: dead, stage: "Build", teamName: "team-d" }, exec)
+
+    const reapTool = tool(registered, "kanban_reap")
+    const reaped = await reapTool.execute({
+      staleAfterSeconds: 86400,
+      liveRunIds: ["still-alive"],
+      liveRunsAsOf: new Date(Date.now() + 1000).toISOString(),
+    }, exec)
+    const text = reapTool.output.render({}, reaped)[0].text
+
+    expect(text).toContain("1 stale claim")
+    expect(text, "a count alone cannot tell a human WHICH claim went").toContain(dead)
+    expect(text).toContain("dead-run")
+    // basis distinguishes "the run is provably gone" from "the clock expired and we
+    // do not know" — k183's whole point. It was computed and then thrown away.
+    expect(text).toContain("run-not-live")
+    // And it must NOT fall back to printing the whole board like renderBoard did.
+    expect(text).not.toContain("Board state:")
   })
 
   // ---- k190: the residual cross-process hole, pinned deliberately ----

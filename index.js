@@ -1282,9 +1282,17 @@ export function apply(ctx) {
       }
 
       case 'moveCard': {
+        // k226：接受 id **或** 标题，并把两种失败分开报。
+        // 之前只认 id，而 bounce(:1050) 和 finalize 都已经带了标题回退，ready_cards 的
+        // 参数说明也写着"stage id or title"——四个吃阶段的动词里三个认标题，唯独
+        // moveCard 不认，而它正是人拖拽和"按阶段名搬卡"会走的那个。
+        // 单一错误串 'Card or list not found' 覆盖两个独立原因：传对卡 id + 传阶段标题，
+        // 与传错卡 id，得到的字符串一模一样。实测代价是一次白跑的往返——自然读法是
+        // "k190 不存在"，于是人去查卡列表，而错的其实是列参数的形式。
         const card = findCard(board, str(a.id, ''))
-        const target = findColumn(board, str(a.columnId, ''))
-        if (!card || !target) return result({ error: 'Card or list not found' })
+        const target = findColumn(board, str(a.columnId, '')) || board.columns.find((c) => c.title === str(a.columnId, ''))
+        if (!card) return result({ error: 'Card not found: ' + str(a.id, '') })
+        if (!target) return result({ error: 'Unknown target list: ' + str(a.columnId, '') })
         const fromCol = findColumn(board, card.columnId)
         const fromTitle = fromCol ? fromCol.title : String(card.columnId)
         board.cards = board.cards.filter((c) => c.id !== card.id)
@@ -1824,6 +1832,37 @@ export function apply(ctx) {
             lines.push('[' + c.id + '] ' + c.title)
             if (c.priority) lines.push('Priority: ' + c.priority)
             if (c.label) lines.push('Label: ' + c.label)
+            // k386：state 必须打印。这个工具的描述承诺"完整的卡片"，而 v5 之后卡片
+            // 最有操作意义的一件事——"谁持有它"——只存在于 card.state 里。渲染层不读
+            // 它的代价实测过：验证 k179/k311/k183 时只能直接 cat
+            // ~/.dsh-boards/<ws>/board.json，而工具层存在的意义正是消除这种耦合。
+            // 只在非默认时打印，一张干净的卡不该多出一段噪音。
+            const st = c.state
+            if (st) {
+              const stateLines = []
+              if (st.owner) {
+                stateLines.push(
+                  '  owner: ' + st.owner +
+                  (st.ownerRunId && st.ownerRunId !== st.owner ? ' (run ' + st.ownerRunId + ')' : '') +
+                  (st.heartbeatAt ? ', heartbeat ' + st.heartbeatAt : ', no heartbeat'),
+                )
+              }
+              if (st.dispatched) {
+                stateLines.push('  dispatched: ' + st.dispatched.stage + ' → team ' + st.dispatched.teamName + ' at ' + st.dispatched.at)
+              }
+              if (st.bounceCount) {
+                const edges = Object.entries(st.bouncesByEdge || {}).map(([e, n]) => e + '×' + n)
+                stateLines.push('  bounces: ' + st.bounceCount + (edges.length ? ' (' + edges.join(', ') + ')' : ''))
+              }
+              if (st.lastBounceReason) stateLines.push('  lastBounceReason: ' + st.lastBounceReason)
+              if (st.specPath) stateLines.push('  specPath: ' + st.specPath)
+              if (st.cardKey) stateLines.push('  cardKey: ' + st.cardKey)
+              if (Array.isArray(st.laneBranches) && st.laneBranches.length > 0) {
+                stateLines.push('  laneBranches: ' + st.laneBranches.join(', '))
+              }
+              lines.push(stateLines.length > 0 ? 'State:' : 'State: unclaimed')
+              lines.push(...stateLines)
+            }
             if (c.note) lines.push('Note: ' + c.note)
             if (Array.isArray(c.comments) && c.comments.length > 0) {
               lines.push('Comments:')
@@ -1910,7 +1949,7 @@ export function apply(ctx) {
       parameters: params(
         {
           id: { type: 'string', description: 'Card id' },
-          columnId: { type: 'string', description: 'Target list id' },
+          columnId: { type: 'string', description: 'Target list id or title' },
           toIndex: { type: 'integer', description: 'Position within the target list (optional); takes effect when reordering within the same list, 0 = top' },
         },
         ['id', 'columnId'],
@@ -1998,7 +2037,32 @@ export function apply(ctx) {
         },
         ['staleAfterSeconds'],
       ),
-      output: output(renderBoard),
+      // k386，与 k254 同一个形状：reap 算出了 released（每张卡的 id / owner /
+      // heartbeatAt / basis），结果对象里带着，schema 里声明了，然后走 renderBoard
+      // 被丢掉——调用方只读到"Reaped 3 stale claim(s)"，无从知道是哪三张、谁持有、
+      // 依据是什么。basis 存在的全部意义就是区分 run-not-live（那个 run 被证明不在了）
+      // 和 heartbeat-expired（只是时钟到了，并不知道死没死）——这正是 k183 的分歧点，
+      // 而它被算出来又扔了。这里打印 value.released；board 依旧不打印，因为回收动作
+      // 关心的是"释放了什么"，不是整块看板。
+      output: {
+        schema: resultSchema,
+        render: (args, value) => {
+          const lines = []
+          if (Array.isArray(value && value.warnings)) {
+            for (const w of value.warnings) lines.push('⚠ ' + w)
+          }
+          lines.push(String((value && value.message) || ''))
+          const released = value && Array.isArray(value.released) ? value.released : []
+          for (const r of released) {
+            lines.push(
+              '  - [' + r.id + '] released from ' + r.owner +
+              ' — basis: ' + r.basis +
+              ' (last heartbeat ' + (r.heartbeatAt || 'never') + ')',
+            )
+          }
+          return [{ type: 'text', text: lines.join('\n') }]
+        },
+      },
       async execute(args, exec) {
         return runTool('reap', args, exec)
       },
