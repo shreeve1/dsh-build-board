@@ -1195,12 +1195,28 @@ export function apply(ctx) {
           if (!st.owner) continue
           const beat = st.heartbeatAt ? Date.parse(st.heartbeatAt) : NaN
           // 存活性分支优先：它是事实，时钟只是推测。
+          //
+          // 但两条分支都必须跳过 dispatched，判据只写一次，不许各写各的。
+          // 时钟分支跳过 dispatched 是 k183；存活性分支原本没有这个守卫，于是
+          // k305 把 liveRunIds 接上之后，反而从另一条路重新打开了 k183：
+          // outcome D 的定义就是"派工的那个 run 结束、团队继续干活"，所以下一个
+          // tick 报上来的 running 列表里必然没有它，reap 于是判定 provablyDead，
+          // 在团队还在写 worktree 的时候把卡放掉。
+          //
+          // 而且收割一张 dispatched 卡换不来任何东西：readyCards 会跳过一切
+          // owner 非空的卡，所以派工中的卡本来就没有第二个 tick 能认领它。
+          // 清掉 owner 只会让它重新可认领，把"一个团队在写"变成"两个团队在写
+          // 同一个 worktree"。派工中的卡由团队自身的持久状态（team.json + 仓库）
+          // 收尾，走 finalizeCard；派工 run 的死亡是设计使然，不携带任何关于
+          // 团队死活的信息。
+          const dispatched = st.dispatched != null
           const olderThanSnapshot = Number.isFinite(beat) && beat < asOf
-          const provablyDead = liveSet !== null && olderThanSnapshot && !liveSet.has(st.owner)
+          const provablyDead =
+            !dispatched && liveSet !== null && olderThanSnapshot && !liveSet.has(st.owner)
           let reason
           if (provablyDead) {
             reason = 'reaped: owning run ' + st.owner + ' was not among the live runs reported at ' + a.liveRunsAsOf
-          } else if (!st.dispatched && (!Number.isFinite(beat) || beat < cutoff)) {
+          } else if (!dispatched && (!Number.isFinite(beat) || beat < cutoff)) {
             // 措辞刻意不说"已经死了"——这一支并不知道。它只知道心跳旧了。
             reason = 'reaped: no heartbeat from owning run ' + st.owner + ' for over ' + seconds +
               's and its liveness was not reported'

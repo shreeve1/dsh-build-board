@@ -934,13 +934,13 @@ describe("host board seam", () => {
   })
 
   // The authoritative branch: absence from a COMPLETE live-run snapshot is a fact
-  // the caller vouches for, so it reaps even a dispatched card.
-  it("reaps a dispatched card when its run is absent from a live-run snapshot", async () => {
+  // the caller vouches for. It reaps an UNDISPATCHED claim — the case k305 exists
+  // for, where a run died holding a card and nobody is working on it.
+  it("reaps an undispatched card when its run is absent from a live-run snapshot", async () => {
     const { registered, exec } = boot()
-    const add = await tool(registered, "kanban_add_card").execute({ title: "Orphaned build" }, exec)
+    const add = await tool(registered, "kanban_add_card").execute({ title: "Orphaned claim" }, exec)
     const id = add.board.cards[0].id
     await tool(registered, "kanban_claim_card").execute({ id, ownerRunId: "dead-run" }, exec)
-    await tool(registered, "kanban_dispatch_card").execute({ id, stage: "Build", teamName: "team-x" }, exec)
 
     const reaped = await tool(registered, "kanban_reap").execute({
       staleAfterSeconds: 86400,
@@ -953,6 +953,59 @@ describe("host board seam", () => {
     expect(card.card.state.owner).toBe(null)
     // The reason must name the evidence, and must NOT claim the run "went stale".
     expect(card.card.state.lastBounceReason).toContain("not among the live runs")
+  })
+
+  // THE INVERSE — the assertion that would have caught k518. Outcome D is DEFINED
+  // as "the dispatching run ends while its team keeps working", so under per-stage
+  // ticks that run is absent from every later snapshot BY DESIGN. Its absence is
+  // not evidence the team stopped. Reaping here clears the owner mid-write, and
+  // buys nothing: readyCards already skips every owned card, so no second tick
+  // could claim it anyway. Clearing the owner is what MAKES a double dispatch into
+  // one worktree possible.
+  it("never reaps a dispatched card, even when its run is absent from the snapshot", async () => {
+    const { registered, exec } = boot()
+    const add = await tool(registered, "kanban_add_card").execute({ title: "Live build" }, exec)
+    const id = add.board.cards[0].id
+    await tool(registered, "kanban_claim_card").execute({ id, ownerRunId: "dispatching-run" }, exec)
+    await tool(registered, "kanban_dispatch_card").execute({ id, stage: "Build", teamName: "team-x" }, exec)
+
+    const reaped = await tool(registered, "kanban_reap").execute({
+      staleAfterSeconds: 1,
+      liveRunIds: ["a-totally-different-run"],
+      liveRunsAsOf: new Date(Date.now() + 1000).toISOString(),
+    }, exec)
+    expect(reaped.message).toContain("0 stale claim")
+    const card = await tool(registered, "kanban_get_card").execute({ id }, exec)
+    expect(card.card.state.owner, "a working team must not have its card stolen").toBe("dispatching-run")
+    expect(card.card.state.dispatched).toMatchObject({ stage: "Build", teamName: "team-x" })
+  })
+
+  // Never-reaped must not mean never-recoverable. A dispatched card whose team
+  // really did die is reconciled by a LATER tick through finalize — the
+  // authoritative cleanup path, which reads the team's own durable state rather
+  // than the run table. Without this, "skip dispatched" would trade a stolen card
+  // for a permanently stuck one.
+  it("lets a later run finalize a dispatched card whose dispatching run is gone", async () => {
+    const { registered, exec } = boot()
+    const add = await tool(registered, "kanban_add_card").execute({ title: "Dead team" }, exec)
+    const id = add.board.cards[0].id
+    await tool(registered, "kanban_claim_card").execute({ id, ownerRunId: "gone-run" }, exec)
+    await tool(registered, "kanban_dispatch_card").execute({ id, stage: "Build", teamName: "team-dead" }, exec)
+    await tool(registered, "kanban_move_card").execute({ id, columnId: "Decompose" }, exec).catch(() => {})
+
+    // A different tick, later, having read team.json and found the team terminal.
+    const done = await tool(registered, "kanban_finalize_card").execute({
+      id, stage: "Build", outcome: "bounce", toStage: "Spec",
+      reason: "team team-dead died without commits on its branch; recreate the lane",
+    }, exec)
+    expect(done.error, "a later tick must be able to reconcile a dispatched card").toBeUndefined()
+
+    const card = await tool(registered, "kanban_get_card").execute({ id }, exec)
+    expect(card.card.state.owner, "finalize releases the claim").toBe(null)
+    expect(card.card.state.dispatched).toBe(null)
+    // And it is ready again, so the pipeline is not deadlocked.
+    const ready = await tool(registered, "kanban_ready_cards").execute({}, exec)
+    expect(ready.cards.map((c) => c.id)).toContain(id)
   })
 
   // THE SNAPSHOT RACE. A claim made AFTER the snapshot was taken could not
@@ -1438,7 +1491,8 @@ describe("host board seam", () => {
     const add = tool(registered, "kanban_add_card")
     const dead = (await add.execute({ title: "Dead run card" }, exec)).board.cards[0].id
     await tool(registered, "kanban_claim_card").execute({ id: dead, ownerRunId: "dead-run" }, exec)
-    await tool(registered, "kanban_dispatch_card").execute({ id: dead, stage: "Build", teamName: "team-d" }, exec)
+    // Deliberately NOT dispatched: reap skips dispatched cards (k518), and this
+    // test is about the RENDERER, not about which cards are eligible.
 
     const reapTool = tool(registered, "kanban_reap")
     const reaped = await reapTool.execute({
